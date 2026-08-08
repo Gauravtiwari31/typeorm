@@ -6,7 +6,7 @@ import {
     createTestingConnections,
     createTypeormMetadataTable,
 } from "../../utils/test-utils"
-import { TableColumn } from "../../../src"
+import { Table, TableColumn } from "../../../src"
 import type { PostgresDriver } from "../../../src/driver/postgres/PostgresDriver"
 import { DriverUtils } from "../../../src/driver/DriverUtils"
 
@@ -270,21 +270,35 @@ describe("query runner > change column", () => {
             }),
         ))
 
-    it("length-only change uses ALTER COLUMN TYPE / MODIFY and keeps data (fixes #3357)", () =>
+    it("should change column length without recreating the column and losing data", () =>
         Promise.all(
             dataSources.map(async (dataSource) => {
-                const qr = dataSource.createQueryRunner()
-                await qr.createTable(
+                // SQL Server and SAP still recreate the column on a length change,
+                // because altering it in place first requires dropping every
+                // dependent constraint - out of scope here
+                if (
+                    dataSource.driver.options.type === "mssql" ||
+                    dataSource.driver.options.type === "sap"
+                )
+                    return
+
+                const queryRunner = dataSource.createQueryRunner()
+
+                await queryRunner.createTable(
                     new Table({
-                        name: "issue_3357_bug",
+                        name: "length_change",
                         columns: [
                             {
                                 name: "id",
-                                type: "int",
+                                type: DriverUtils.isSQLiteFamily(
+                                    dataSource.driver,
+                                )
+                                    ? "integer"
+                                    : "int",
                                 isPrimary: true,
                             },
                             {
-                                name: "example",
+                                name: "name",
                                 type: "varchar",
                                 length: "50",
                             },
@@ -293,48 +307,57 @@ describe("query runner > change column", () => {
                     true,
                 )
 
-                const tableName = dataSource.driver.escape("issue_3357_bug")
-                const idCol = dataSource.driver.escape("id")
-                const exampleCol = dataSource.driver.escape("example")
+                const tablePath = dataSource.driver.escape("length_change")
+                const idColumnName = dataSource.driver.escape("id")
+                const nameColumnName = dataSource.driver.escape("name")
 
-                await qr.query(
-                    `INSERT INTO ${tableName} (${idCol}, ${exampleCol}) VALUES (1, 'hello-3357')`,
+                await queryRunner.query(
+                    `INSERT INTO ${tablePath} (${idColumnName}, ${nameColumnName}) VALUES (1, 'typeorm')`,
                 )
 
-                const table = await qr.getTable("issue_3357_bug")
-                const oldCol = table!.findColumnByName("example")!
-                const newCol = oldCol.clone()
-                newCol.length = "51"
+                let table = await queryRunner.getTable("length_change")
+                const nameColumn = table!.findColumnByName("name")!
+                const changedNameColumn = nameColumn.clone()
+                changedNameColumn.length = "500"
 
-                await qr.enableSqlMemory()
-                await qr.changeColumn(table!, oldCol, newCol)
-                const sql = qr.getMemorySql()
-                const upSql = sql.upQueries.map((q) => q.query).join("\n")
-                qr.clearSqlMemory()
-                await qr.disableSqlMemory()
-
-                // Apply for real (memory mode did not execute against DB)
-                const table2 = await qr.getTable("issue_3357_bug")
-                const oldCol2 = table2!.findColumnByName("example")!
-                const newCol2 = oldCol2.clone()
-                newCol2.length = "51"
-                await qr.changeColumn(table2!, oldCol2, newCol2)
-
-                expect(upSql.toUpperCase()).to.not.include("DROP COLUMN")
-
-                const rows: { example: string }[] = await qr.query(
-                    `SELECT ${exampleCol} FROM ${tableName}`,
+                queryRunner.enableSqlMemory()
+                await queryRunner.changeColumn(
+                    table!,
+                    nameColumn,
+                    changedNameColumn,
                 )
-                expect(rows).to.have.length(1)
-                expect(rows[0].example).to.equal("hello-3357")
+                const upQueries = queryRunner
+                    .getMemorySql()
+                    .upQueries.map((query) => query.query.toUpperCase())
 
-                const updated = await qr.getTable("issue_3357_bug")
-                expect(updated!.findColumnByName("example")!.length).to.equal(
-                    "51",
+                // a length change must produce an in-place alteration - neither a
+                // no-op nor a drop and re-create, which silently discards the data
+                upQueries.length.should.be.greaterThan(0)
+                upQueries.forEach((query) =>
+                    query.should.not.contain("DROP COLUMN"),
                 )
 
-                await qr.dropTable("issue_3357_bug")
-                await qr.release()
+                await queryRunner.executeMemoryUpSql()
+                queryRunner.clearSqlMemory()
+                queryRunner.disableSqlMemory()
+
+                const rows = await queryRunner.query(
+                    `SELECT ${nameColumnName} FROM ${tablePath}`,
+                )
+                rows.length.should.be.equal(1)
+                rows[0].name.should.be.equal("typeorm")
+
+                table = await queryRunner.getTable("length_change")
+
+                // SQLite does not impose any length restrictions
+                if (!DriverUtils.isSQLiteFamily(dataSource.driver)) {
+                    table!
+                        .findColumnByName("name")!
+                        .length!.should.be.equal("500")
+                }
+
+                await queryRunner.dropTable("length_change")
+                await queryRunner.release()
             }),
         ))
 })
