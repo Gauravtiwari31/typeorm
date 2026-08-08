@@ -269,4 +269,72 @@ describe("query runner > change column", () => {
                 )
             }),
         ))
+
+    it("length-only change uses ALTER COLUMN TYPE / MODIFY and keeps data (fixes #3357)", () =>
+        Promise.all(
+            dataSources.map(async (dataSource) => {
+                const qr = dataSource.createQueryRunner()
+                await qr.createTable(
+                    new Table({
+                        name: "issue_3357_bug",
+                        columns: [
+                            {
+                                name: "id",
+                                type: "int",
+                                isPrimary: true,
+                            },
+                            {
+                                name: "example",
+                                type: "varchar",
+                                length: "50",
+                            },
+                        ],
+                    }),
+                    true,
+                )
+
+                const tableName = dataSource.driver.escape("issue_3357_bug")
+                const idCol = dataSource.driver.escape("id")
+                const exampleCol = dataSource.driver.escape("example")
+
+                await qr.query(
+                    `INSERT INTO ${tableName} (${idCol}, ${exampleCol}) VALUES (1, 'hello-3357')`,
+                )
+
+                const table = await qr.getTable("issue_3357_bug")
+                const oldCol = table!.findColumnByName("example")!
+                const newCol = oldCol.clone()
+                newCol.length = "51"
+
+                await qr.enableSqlMemory()
+                await qr.changeColumn(table!, oldCol, newCol)
+                const sql = qr.getMemorySql()
+                const upSql = sql.upQueries.map((q) => q.query).join("\n")
+                qr.clearSqlMemory()
+                await qr.disableSqlMemory()
+
+                // Apply for real (memory mode did not execute against DB)
+                const table2 = await qr.getTable("issue_3357_bug")
+                const oldCol2 = table2!.findColumnByName("example")!
+                const newCol2 = oldCol2.clone()
+                newCol2.length = "51"
+                await qr.changeColumn(table2!, oldCol2, newCol2)
+
+                expect(upSql.toUpperCase()).to.not.include("DROP COLUMN")
+
+                const rows: { example: string }[] = await qr.query(
+                    `SELECT ${exampleCol} FROM ${tableName}`,
+                )
+                expect(rows).to.have.length(1)
+                expect(rows[0].example).to.equal("hello-3357")
+
+                const updated = await qr.getTable("issue_3357_bug")
+                expect(updated!.findColumnByName("example")!.length).to.equal(
+                    "51",
+                )
+
+                await qr.dropTable("issue_3357_bug")
+                await qr.release()
+            }),
+        ))
 })
